@@ -1,0 +1,63 @@
+[package]
+authors = ["Nathan Bradshaw", "Enoch Bradshaw"]
+edition = "2021"
+name = "app"
+version = "0.1.0"
+
+# makes `cargo check --all-targets` work
+[[bin]]
+name = "app"
+bench = false
+doctest = false
+test = false
+
+[dependencies]
+cfg-if = "1.0.0"
+cortex-m-rtic = "1.1.4"
+cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
+# cortex-m-rt = "0.7.0"
+panic-rtt-target = { version = "0.1.3"}
+debouncr = "0.2.2"
+log = "0.4.21"
+panic-halt = "0.2.0"
+stm32h7xx-hal = { version = "0.16.0", features = ["stm32h750v","rt","fmc", "xspi", "sdmmc", "sdmmc-fatfs", "usb_hs"] }
+stm32-fmc = "0.3.0"
+rtt-target = "0.5.0"
+lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
+panic-itm = "0.4.2"
+cortex-m-log =  { version = "0.8.0", features = ["itm", "semihosting", "log-integration"] }
+micromath = "2.1.0"
+microfft = "0.6"
+libdaisy = {git = "https://github.com/nathansbradshaw/libdaisy-rust.git", features = ["log-rtt"], commit = "f08c01fd8f950675c6c1051c2310c1cdf7309d8b"}
+synthphone-e-vocal-dsp = {git = "https://github.com/nathansbradshaw/synthphone_e_vocal_dsp.git", commit = "a794ea0acdd376bd6444fbe7fd6df444a6addc6f"}
+# synthphone-e-vocal-dsp = { path = "../synthphone_vocals/"}
+libm = "0.2.8"
+heapless = "0.8.0"
+ssd1306 = "0.7.1"
+fugit = "0.3.7"
+embedded-graphics = "0.7.1"
+tinybmp = "0.4.0"
+rotary-encoder-embedded = "0.3.1"
+midly = { version = "0.5.3", default-features = false }
+
+[features]
+default = ['defmt-default']
+# these features are required by defmt
+defmt-default = []
+defmt-trace = []
+defmt-debug = []
+defmt-info = []
+defmt-warn = []
+defmt-error = []
+
+[profile.dev]
+codegen-units = 1   # better optimizations
+debug = true        # symbols are nice and they don't increase the size in flash
+lto = true          # better optimizations
+opt-level = "s"     # optimize for binary size
+
+[profile.release]
+codegen-units = 1 # better optimizations
+debug = true      # symbols are nice and they don't increase the size in flash
+lto = true        # better optimizations
+opt-level = "s"   # optimize for binary size

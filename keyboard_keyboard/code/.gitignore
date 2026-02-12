@@ -1,0 +1,6 @@
+/target
+.vscode/launch.json
+/mutants.out
+.temp*
+*.wav
+!5_note.wav
