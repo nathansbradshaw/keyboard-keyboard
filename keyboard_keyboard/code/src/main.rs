@@ -1,69 +1,65 @@
 //! hall_effect_keyboard — Daisy Seed + CD74HC4051 + A1302
+//! Relative-threshold scanning with per-channel baseline calibration
 #![no_main]
 #![no_std]
+
+use panic_rtt_target as _;
 
 #[rtic::app(
     device = stm32h7xx_hal::stm32,
     peripherals = true,
-    dispatchers = [DMA1_STR0, DMA1_STR2, DMA1_STR3, DMA1_STR4, DMA1_STR5, DMA1_STR6]
+    dispatchers = [DMA1_STR2, DMA1_STR3, DMA1_STR4, DMA1_STR5, DMA1_STR6]
 )]
 mod app {
     const BLOCK_SIZE: usize = 128;
+    const NUM_KEYS: usize = 8;
+    const NUM_ACTIVE_KEYS: usize = 1; // Only ch=0 is connected right now
 
-    use core::fmt::Write;
     use libdaisy::gpio::*;
     use libdaisy::logger;
     use libdaisy::{audio, system};
-    // GpioExt brings .split() into scope
-    use libdaisy::prelude::_stm32h7xx_hal_gpio_GpioExt;
-    // OneShot brings .read() into scope
-    use cortex_m::prelude::_embedded_hal_adc_OneShot;
+    use stm32h7xx_hal::time::MilliSeconds;
 
     use libdaisy::hal::{
-        adc::{Adc, AdcSampleTime, Resolution},
-        gpio::{gpiob::*, gpioc::*, Analog, Output, PushPull},
+        adc::{self, Adc, AdcSampleTime, Resolution},
+        gpio::{Analog, Output, PushPull},
+        prelude::*,
+        stm32, timer,
     };
     use log::info;
-    use stm32h7xx_hal::time::MilliSeconds;
-    use stm32h7xx_hal::{adc, stm32, timer::Timer};
 
-    // ── Key config ──────────────────────────────────────────────────────────────
-    const NUM_KEYS: usize = 8;
+    // ── ADC config ─────────────────────────────────────────────────────────────
+    const ADC_SAMPLE_TIME: AdcSampleTime = AdcSampleTime::T_16;
+    const ADC_RESOLUTION: Resolution = Resolution::TwelveBit;
 
-    /// ADC counts at first actuation point (~25% travel). Tune after measuring.
-    const FIRST_THRESHOLD: u16 = 1500;
+    // ── Calibration ────────────────────────────────────────────────────────────
+    // Number of samples averaged per channel at startup to establish baseline.
+    const CALIBRATION_SAMPLES: usize = 64;
 
-    /// ADC counts at second actuation point (~75% travel).
-    const SECOND_THRESHOLD: u16 = 2200;
+    // ── Key thresholds (relative to per-channel baseline) ─────────────────────
+    // Tune SECOND_DELTA to roughly the count rise at the bottom of key travel.
+    // Log elapsed_ms during development to find a good VELOCITY_WINDOW_MS.
+    const FIRST_DELTA: u16 = 200; // ~20% of travel
+    const SECOND_DELTA: u16 = 400; // ~40% of travel - tune based on actual max delta
+    const RELEASE_DELTA: u16 = 150; // must drop below 150 to release
 
-    /// Below this -> key released. Lower than FIRST_THRESHOLD for hysteresis.
-    const RELEASE_THRESHOLD: u16 = 1000;
+    // ── Velocity ───────────────────────────────────────────────────────────────
+    // Set this to the elapsed-ms of your slowest intentional keypress (pp).
+    // Everything faster maps linearly up to 127; slower clamps to 1.
+    const VELOCITY_WINDOW_MS: u32 = 80;
 
-    /// Presses faster than this window get maximum velocity.
-    /// Presses slower than this get minimum velocity = 1.
-    const VELOCITY_WINDOW_MS: u32 = 200;
-
-    // ── Debug config ───────────────────────────────────────────────────────────
-    /// Enable continuous ADC output
-    const DEBUG_ADC_OUTPUT: bool = false;
-    /// Output interval in milliseconds
-    const DEBUG_OUTPUT_INTERVAL_MS: u32 = 50;
-    /// Comma-separated list of channels to output (empty = all channels)
-    const DEBUG_CHANNELS: &[usize] = &[];
-
-    // ── Key state machine ────────────────────────────────────────────────────────
-
+    // ── Key state machine ──────────────────────────────────────────────────────
     #[derive(Clone, Copy, Debug)]
-    enum KeyPhase {
+    pub enum KeyPhase {
         Idle,
-        FirstActuated { value: u16, tick: u32 },
+        FirstActuated { tick: u32 },
         FullyActuated { velocity: u8 },
     }
 
     #[derive(Clone, Copy)]
     pub struct KeyState {
         phase: KeyPhase,
-        last_adc: u16,
+        pub last_adc: u16,
     }
 
     impl KeyState {
@@ -74,36 +70,54 @@ mod app {
             }
         }
 
-        fn update(&mut self, adc_value: u16, tick: u32) -> Option<KeyEvent> {
+        /// `adc_value` is the raw reading; `baseline` is the resting value
+        /// captured at boot. All threshold comparisons use the delta so the
+        /// firmware works regardless of sensor placement or supply voltage.
+        fn update(
+            &mut self,
+            adc_value: u16,
+            baseline: u16,
+            tick: u32,
+            key_idx: usize,
+        ) -> Option<KeyEvent> {
             self.last_adc = adc_value;
+
+            // How far above rest is the sensor right now?
+            let delta = adc_value.saturating_sub(baseline);
 
             match self.phase {
                 KeyPhase::Idle => {
-                    if adc_value >= FIRST_THRESHOLD {
-                        self.phase = KeyPhase::FirstActuated {
-                            value: adc_value,
-                            tick,
-                        };
+                    if delta >= FIRST_DELTA {
+                        info!(
+                            "key={} FirstActuated: delta={} adc={} baseline={}",
+                            key_idx, delta, adc_value, baseline
+                        );
+                        self.phase = KeyPhase::FirstActuated { tick };
                     }
                     None
                 }
 
-                KeyPhase::FirstActuated { tick: t1, .. } => {
-                    if adc_value >= SECOND_THRESHOLD {
+                KeyPhase::FirstActuated { tick: t1 } => {
+                    if delta >= SECOND_DELTA {
+                        // Key reached full actuation — compute velocity from
+                        // how long it took to travel from FIRST to SECOND.
                         let elapsed = tick.saturating_sub(t1);
+                        info!("key fully actuated: delta={} elapsed={}ms", delta, elapsed);
 
                         let velocity = if elapsed == 0 {
                             127u8
                         } else if elapsed >= VELOCITY_WINDOW_MS {
                             1u8
                         } else {
+                            // Linear mapping: 0ms → 127, VELOCITY_WINDOW_MS → 1
                             let v = 127u32.saturating_sub((elapsed * 126) / VELOCITY_WINDOW_MS);
-                            (v + 1) as u8
+                            (v + 1).min(127) as u8
                         };
 
                         self.phase = KeyPhase::FullyActuated { velocity };
                         Some(KeyEvent::NoteOn { velocity })
-                    } else if adc_value < RELEASE_THRESHOLD {
+                    } else if delta < RELEASE_DELTA {
+                        // Released before reaching full actuation (light brush).
                         self.phase = KeyPhase::Idle;
                         None
                     } else {
@@ -112,7 +126,7 @@ mod app {
                 }
 
                 KeyPhase::FullyActuated { .. } => {
-                    if adc_value < RELEASE_THRESHOLD {
+                    if delta < RELEASE_DELTA {
                         self.phase = KeyPhase::Idle;
                         Some(KeyEvent::NoteOff)
                     } else {
@@ -124,33 +138,33 @@ mod app {
     }
 
     #[derive(Debug)]
-    enum KeyEvent {
+    pub enum KeyEvent {
         NoteOn { velocity: u8 },
         NoteOff,
     }
 
-    // ── RTIC resources ───────────────────────────────────────────────────────────
-
+    // ── RTIC resources ──────────────────────────────────────────────────────────
     #[shared]
     struct Shared {
         tick_ms: u32,
-        last_debug_tick: u32,
         key_states: [KeyState; NUM_KEYS],
+        baselines: [u16; NUM_KEYS],
+        event_queue: heapless::spsc::Queue<(usize, KeyEvent), 32>,
     }
 
     #[local]
     struct Local {
         audio: audio::Audio,
-        adc1: adc::Adc<stm32::ADC1, adc::Enabled>,
+        adc: Adc<stm32::ADC1, adc::Enabled>,
         adc_pin: Daisy15<Analog>,
         s0: Daisy0<Output<PushPull>>,
         s1: Daisy1<Output<PushPull>>,
         s2: Daisy2<Output<PushPull>>,
-        timer2: Timer<stm32::TIM2>, // Add timer
+        timer2: timer::Timer<stm32::TIM2>,
+        adc_buffer: [u32; NUM_KEYS],
     }
 
-    // ── init ─────────────────────────────────────────────────────────────────────
-
+    // ── init ────────────────────────────────────────────────────────────────────
     #[init]
     fn init(ctx: init::Context) -> (Shared, Local, init::Monotonics) {
         logger::init();
@@ -158,118 +172,94 @@ mod app {
         let mut core = ctx.core;
         let device = ctx.device;
 
-        // ── Clocks ───────────────────────────────────────────────
         let ccdr = system::System::init_clocks(device.PWR, device.RCC, &device.SYSCFG);
-
-        // ── libdaisy system init ────────────────────────────────
         let mut system = libdaisy::system_init!(core, device, ccdr, BLOCK_SIZE);
 
-        // ── GPIO: CD74HC4051 select pins ─────────────────────────
-        let mut s0 = system
-            .gpio
-            .daisy0
-            .take()
-            .expect("Failed to get daisy0")
-            .into_push_pull_output();
+        // ── GPIO ─────────────────────────────────────────────────────
+        let mut s0 = system.gpio.daisy0.take().unwrap().into_push_pull_output();
+        let mut s1 = system.gpio.daisy1.take().unwrap().into_push_pull_output();
+        let mut s2 = system.gpio.daisy2.take().unwrap().into_push_pull_output();
+        let mut adc_pin = system.gpio.daisy15.take().unwrap().into_analog();
 
-        let mut s1 = system
-            .gpio
-            .daisy1
-            .take()
-            .expect("Failed to get daisy1")
-            .into_push_pull_output();
+        // ── ADC ──────────────────────────────────────────────────────
+        let mut adc = system.adc1.enable();
+        adc.set_resolution(ADC_RESOLUTION);
+        adc.set_sample_time(ADC_SAMPLE_TIME);
 
-        let mut s2 = system
-            .gpio
-            .daisy2
-            .take()
-            .expect("Failed to get daisy2")
-            .into_push_pull_output();
+        // Wait for power supply and sensors to fully stabilize
+        cortex_m::asm::delay(480 * 50_000); // 50ms startup delay
 
-        // ── ADC pin (A0 = PC0) ───────────────────────────────────
-        let mut adc_pin = system
-            .gpio
-            .daisy15
-            .take()
-            .expect("Failed to get A0")
-            .into_analog();
+        // ── Baseline calibration ─────────────────────────────────────
+        // Sample every channel CALIBRATION_SAMPLES times and average.
+        // Keys must be fully released during this window (~few ms total).
+        let mut baselines = [0u16; NUM_KEYS];
+        for ch in 0..NUM_ACTIVE_KEYS {
+            set_mux_channel(ch, &mut s0, &mut s1, &mut s2);
+            // Let the mux and sensor settle before we start sampling.
+            cortex_m::asm::delay(480 * 100); // Increased from 10 to 100 (100µs)
 
-        // ── ADC configuration ───────────────────────────────────
-        let mut adc1 = system.adc1.enable();
-        adc1.set_resolution(adc::Resolution::SixteenBit);
-        adc1.set_sample_time(AdcSampleTime::T_64);
+            let mut accumulator: u32 = 0;
+            let mut sample_count = 0u32;
+            for i in 0..CALIBRATION_SAMPLES {
+                let result: Result<u32, _> = adc.read(&mut adc_pin);
+                if let Ok(raw) = result {
+                    accumulator += raw;
+                    sample_count += 1;
+                    // Log first few samples to see what's happening
+                    if ch == 0 && i < 5 {
+                        info!("calibration ch=0 sample {} raw={}", i, raw);
+                    }
+                }
+                cortex_m::asm::delay(480 * 10); // Increased from 2 to 10 (10µs between samples)
+            }
+            let avg = if sample_count > 0 {
+                accumulator / sample_count
+            } else {
+                0
+            };
+            baselines[ch] = avg as u16;
+            info!(
+                "baseline ch={} value={} (from {} samples)",
+                ch, baselines[ch], sample_count
+            );
+        }
 
-        // ── Timer2 @ 1kHz ───────────────────────────────────────
+        // ── Timer2 @ 1 kHz ───────────────────────────────────────────
         let mut timer2 = stm32h7xx_hal::timer::TimerExt::timer(
             device.TIM2,
-            MilliSeconds::from_ticks(100).into_rate(),
+            MilliSeconds::from_ticks(1).into_rate(),
             ccdr.peripheral.TIM2,
             &ccdr.clocks,
         );
-        timer2.listen(stm32h7xx_hal::timer::Event::TimeOut);
+        timer2.listen(timer::Event::TimeOut);
 
-        timer2.set_freq(MilliSeconds::from_ticks(5).into_rate());
+        // Prime mux at channel 0 before the first interrupt fires.
+        set_mux_channel(0, &mut s0, &mut s1, &mut s2);
 
         info!("Hall effect keyboard startup done!");
-
-        // Test the multiplexer
-        info!("Testing 74HC4051...");
-
-        // Test all combinations of select pins
-        for s2_val in 0..2 {
-            for s1_val in 0..2 {
-                for s0_val in 0..2 {
-                    if s0_val == 0 {
-                        s0.set_low();
-                    } else {
-                        s0.set_high();
-                    }
-                    if s1_val == 0 {
-                        s1.set_low();
-                    } else {
-                        s1.set_high();
-                    }
-                    if s2_val == 0 {
-                        s2.set_low();
-                    } else {
-                        s2.set_high();
-                    }
-
-                    cortex_m::asm::delay(48_000);
-
-                    let raw: u32 = adc1.read(&mut adc_pin).unwrap_or(0);
-                    let raw = (raw >> 4) as u16;
-
-                    let ch = (s2_val << 2) | (s1_val << 1) | s0_val;
-                    info!(
-                        "S2={} S1={} S0={} -> Ch{}: {}",
-                        s2_val, s1_val, s0_val, ch, raw
-                    );
-                }
-            }
-        }
 
         (
             Shared {
                 tick_ms: 0,
-                last_debug_tick: 0,
                 key_states: [KeyState::new(); NUM_KEYS],
+                baselines,
+                event_queue: heapless::spsc::Queue::new(),
             },
             Local {
                 audio: system.audio,
-                adc1,
+                adc,
                 adc_pin,
                 s0,
                 s1,
                 s2,
-                timer2, // Add timer to locals
+                timer2,
+                adc_buffer: [0; NUM_KEYS],
             },
             init::Monotonics(),
         )
     }
 
-    // ── idle ─────────────────────────────────────────────────────────────────────
-
+    // ── idle ────────────────────────────────────────────────────────────────────
     #[idle]
     fn idle(_ctx: idle::Context) -> ! {
         loop {
@@ -277,110 +267,89 @@ mod app {
         }
     }
 
-    // ── Audio passthrough ────────────────────────────────────────────────────────
-
-    #[task(binds = DMA1_STR1, local = [audio], priority = 8)]
+    // ── Audio ──────────────────────────────────────────────────────────────────
+    #[task(binds = DMA1_STR1, priority = 8, local = [audio])]
     fn audio_handler(ctx: audio_handler::Context) {
-        let audio = ctx.local.audio;
-        audio.for_each(|left, right| (left, right));
+        ctx.local.audio.for_each(|left, right| (left, right));
     }
 
-    // ── 1 ms Timer2 ─────────────────────────────────────────────────────────────
-
-    #[task(binds = TIM2, local = [timer2], shared = [tick_ms, last_debug_tick], priority = 15)]
+    // ── Timer @ 1 kHz ─────────────────────────────────────────────────────────
+    // Scans all 8 channels every tick. Total scan takes ~16µs (8 × 2µs settle),
+    // well within the 1ms budget. All key state updates happen here so latency
+    // is bounded to one tick (~1ms).
+    #[task(
+        binds = TIM2,
+        local  = [timer2, adc, adc_pin, s0, s1, s2, adc_buffer],
+        shared = [tick_ms, key_states, baselines, event_queue],
+        priority = 15
+    )]
     fn timer_handler(mut ctx: timer_handler::Context) {
-        // Clear the interrupt flag
         ctx.local.timer2.clear_irq();
 
-        // Increment tick counter
+        // Increment and snapshot the millisecond counter.
         let now = ctx.shared.tick_ms.lock(|t| {
             *t = t.wrapping_add(1);
             *t
         });
 
-        // Spawn key scanner
-        scan_keys::spawn().ok();
+        // Collect events into a stack buffer so we only take each lock once.
+        let mut pending: heapless::Vec<(usize, KeyEvent), 8> = heapless::Vec::new();
 
-        // Spawn debug output task periodically
-        if DEBUG_ADC_OUTPUT {
-            let last_debug = ctx.shared.last_debug_tick.lock(|t| *t);
-            if now.wrapping_sub(last_debug) >= DEBUG_OUTPUT_INTERVAL_MS {
-                ctx.shared.last_debug_tick.lock(|t| *t = now);
-                output_adc_values::spawn().ok();
+        // Read baselines once — they never change after init.
+        let baselines = ctx.shared.baselines.lock(|b| *b);
+
+        for ch in 0..NUM_ACTIVE_KEYS {
+            set_mux_channel(ch, ctx.local.s0, ctx.local.s1, ctx.local.s2);
+            // ~2µs for mux switching + A1302 output settling.
+            cortex_m::asm::delay(480 * 2);
+
+            let result: Result<u32, _> = ctx.local.adc.read(ctx.local.adc_pin);
+            if let Ok(raw) = result {
+                ctx.local.adc_buffer[ch] = raw;
+
+                ctx.shared.key_states.lock(|states| {
+                    if let Some(event) = states[ch].update(raw as u16, baselines[ch], now, ch) {
+                        pending.push((ch, event)).ok();
+                    }
+                });
             }
         }
-    }
 
-    // ── Key scanner ───────────────────────────────────────────────────────────────
-
-    #[task(
-        local  = [adc1, adc_pin, s0, s1, s2],
-        shared = [tick_ms, key_states],
-        priority = 2,
-        capacity = 2,
-    )]
-    fn scan_keys(mut ctx: scan_keys::Context) {
-        let adc = ctx.local.adc1;
-        let adc_pin = ctx.local.adc_pin;
-        let s0 = ctx.local.s0;
-        let s1 = ctx.local.s1;
-        let s2 = ctx.local.s2;
-
-        let now = ctx.shared.tick_ms.lock(|t| *t);
-
-        for key_idx in 0..NUM_KEYS {
-            set_mux_channel(key_idx, s0, s1, s2);
-            cortex_m::asm::delay(4_800);
-
-            let raw: u32 = adc.read(adc_pin).unwrap_or(0);
-            let raw = (raw >> 4) as u16;
-
-            ctx.shared.key_states.lock(|states| {
-                if let Some(event) = states[key_idx].update(raw, now) {
-                    handle_key_event(key_idx, event);
+        // Single lock to flush all events into the queue.
+        if !pending.is_empty() {
+            ctx.shared.event_queue.lock(|queue| {
+                for item in pending {
+                    queue.enqueue(item).ok();
                 }
             });
         }
+
+        process_events::spawn().ok();
     }
 
-    // ── Debug: Output ADC values ─────────────────────────────────────────────────
-
-    #[task(
-        shared = [key_states],
-        priority = 1,
-        capacity = 2,
-    )]
-    fn output_adc_values(mut ctx: output_adc_values::Context) {
-        info!("output adc values");
-        ctx.shared.key_states.lock(|states| {
-            let mut output = heapless::String::<128>::new();
-
-            if DEBUG_CHANNELS.is_empty() {
-                output.push_str("ADC: ").ok();
-                for (i, state) in states.iter().enumerate() {
-                    if i > 0 {
-                        output.push_str(", ").ok();
+    // ── Process events ────────────────────────────────────────────────────────
+    #[task(shared = [event_queue], priority = 1, capacity = 32)]
+    fn process_events(mut ctx: process_events::Context) {
+        ctx.shared.event_queue.lock(|queue| {
+            while let Some((key_idx, event)) = queue.dequeue() {
+                match event {
+                    KeyEvent::NoteOn { velocity } => {
+                        let note = 60u8 + key_idx as u8;
+                        info!("NoteOn  key={} note={} vel={}", key_idx, note, velocity);
+                        // TODO: send USB MIDI / I2S tone etc.
                     }
-                    write!(&mut output, "{}:{}", i, state.last_adc).ok();
-                }
-            } else {
-                output.push_str("ADC (selected): ").ok();
-                for (j, &ch) in DEBUG_CHANNELS.iter().enumerate() {
-                    if ch < NUM_KEYS {
-                        if j > 0 {
-                            output.push_str(", ").ok();
-                        }
-                        write!(&mut output, "{}:{}", ch, states[ch].last_adc).ok();
+                    KeyEvent::NoteOff => {
+                        let note = 60u8 + key_idx as u8;
+                        info!("NoteOff key={} note={}", key_idx, note);
+                        // TODO: send USB MIDI / I2S tone etc.
                     }
                 }
             }
-
-            info!("{}", output);
         });
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────────
-
+    // ── Helpers ───────────────────────────────────────────────────────────────
+    #[inline(always)]
     fn set_mux_channel(
         ch: usize,
         s0: &mut Daisy0<Output<PushPull>>,
@@ -388,32 +357,19 @@ mod app {
         s2: &mut Daisy2<Output<PushPull>>,
     ) {
         if ch & 0b001 != 0 {
-            s0.set_high();
+            s0.set_high()
         } else {
-            s0.set_low();
+            s0.set_low()
         }
         if ch & 0b010 != 0 {
-            s1.set_high();
+            s1.set_high()
         } else {
-            s1.set_low();
+            s1.set_low()
         }
         if ch & 0b100 != 0 {
-            s2.set_high();
+            s2.set_high()
         } else {
-            s2.set_low();
-        }
-    }
-
-    fn handle_key_event(key_idx: usize, event: KeyEvent) {
-        match event {
-            KeyEvent::NoteOn { velocity } => {
-                let note = 60u8 + key_idx as u8;
-                info!("NoteOn  key={} note={} vel={}", key_idx, note, velocity);
-            }
-            KeyEvent::NoteOff => {
-                let note = 60u8 + key_idx as u8;
-                info!("NoteOff key={} note={}", key_idx, note);
-            }
+            s2.set_low()
         }
     }
 }
