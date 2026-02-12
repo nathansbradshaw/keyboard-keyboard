@@ -10,6 +10,7 @@
 mod app {
     const BLOCK_SIZE: usize = 128;
 
+    use core::fmt::Write;
     use libdaisy::gpio::*;
     use libdaisy::logger;
     use libdaisy::{audio, system};
@@ -33,14 +34,22 @@ mod app {
     const FIRST_THRESHOLD: u16 = 1500;
 
     /// ADC counts at second actuation point (~75% travel).
-    const SECOND_THRESHOLD: u16 = 2800;
+    const SECOND_THRESHOLD: u16 = 2200;
 
     /// Below this -> key released. Lower than FIRST_THRESHOLD for hysteresis.
-    const RELEASE_THRESHOLD: u16 = 1200;
+    const RELEASE_THRESHOLD: u16 = 1000;
 
     /// Presses faster than this window get maximum velocity.
     /// Presses slower than this get minimum velocity = 1.
     const VELOCITY_WINDOW_MS: u32 = 200;
+
+    // ── Debug config ───────────────────────────────────────────────────────────
+    /// Enable continuous ADC output
+    const DEBUG_ADC_OUTPUT: bool = true;
+    /// Output interval in milliseconds
+    const DEBUG_OUTPUT_INTERVAL_MS: u32 = 50;
+    /// Comma-separated list of channels to output (empty = all channels)
+    const DEBUG_CHANNELS: &[usize] = &[]; // e.g., &[0, 1, 2] for first three keys
 
     // ── Key state machine ────────────────────────────────────────────────────────
 
@@ -52,18 +61,22 @@ mod app {
     }
 
     #[derive(Clone, Copy)]
-    struct KeyState {
+    pub struct KeyState {
         phase: KeyPhase,
+        last_adc: u16, // Store last ADC reading for debug
     }
 
     impl KeyState {
         const fn new() -> Self {
             Self {
                 phase: KeyPhase::Idle,
+                last_adc: 0,
             }
         }
 
         fn update(&mut self, adc_value: u16, tick: u32) -> Option<KeyEvent> {
+            self.last_adc = adc_value; // Store ADC value
+
             match self.phase {
                 KeyPhase::Idle => {
                     if adc_value >= FIRST_THRESHOLD {
@@ -126,17 +139,18 @@ mod app {
     #[shared]
     struct Shared {
         tick_ms: u32,
+        last_debug_tick: u32,             // Track last debug output time
+        key_states: [KeyState; NUM_KEYS], // Moved to shared for access by multiple tasks
     }
 
     #[local]
     struct Local {
         audio: audio::Audio,
         adc1: adc::Adc<stm32::ADC1, adc::Enabled>,
-        adc_pin: Daisy16<Analog>,
+        adc_pin: Daisy15<Analog>,
         s0: Daisy0<Output<PushPull>>,
         s1: Daisy1<Output<PushPull>>,
         s2: Daisy2<Output<PushPull>>,
-        key_states: [KeyState; NUM_KEYS],
     }
 
     // ── init ─────────────────────────────────────────────────────────────────────
@@ -163,7 +177,7 @@ mod app {
 
         // ── GPIO: CD74HC4051 select pins ─────────────────────────
         // D0 = PB8
-        let s0 = system
+        let mut s0 = system
             .gpio
             .daisy0
             .take()
@@ -171,7 +185,7 @@ mod app {
             .into_push_pull_output();
 
         // D1 = PB9
-        let s1 = system
+        let mut s1 = system
             .gpio
             .daisy1
             .take()
@@ -179,7 +193,7 @@ mod app {
             .into_push_pull_output();
 
         // D2 = PB10
-        let s2 = system
+        let mut s2 = system
             .gpio
             .daisy2
             .take()
@@ -187,9 +201,9 @@ mod app {
             .into_push_pull_output();
 
         // ── ADC pin (A0 = PC0) ───────────────────────────────────
-        let adc_pin = system
+        let mut adc_pin = system
             .gpio
-            .daisy16 // A0 on Daisy Seed
+            .daisy15 // A0 on Daisy Seed
             .take()
             .expect("Failed to get A0")
             .into_analog();
@@ -200,9 +214,58 @@ mod app {
         adc1.set_sample_time(AdcSampleTime::T_64);
 
         info!("Hall effect keyboard startup done!");
+        if DEBUG_ADC_OUTPUT {
+            info!(
+                "ADC debug output enabled - interval: {}ms",
+                DEBUG_OUTPUT_INTERVAL_MS
+            );
+            if !DEBUG_CHANNELS.is_empty() {
+                info!("Monitoring only channels: {:?}", DEBUG_CHANNELS);
+            }
+        }
+
+        info!("Testing 74HC4051...");
+
+        // Test all combinations of select pins
+        for s2_val in 0..2 {
+            for s1_val in 0..2 {
+                for s0_val in 0..2 {
+                    if s0_val == 0 {
+                        s0.set_low();
+                    } else {
+                        s0.set_high();
+                    }
+                    if s1_val == 0 {
+                        s1.set_low();
+                    } else {
+                        s1.set_high();
+                    }
+                    if s2_val == 0 {
+                        s2.set_low();
+                    } else {
+                        s2.set_high();
+                    }
+
+                    cortex_m::asm::delay(48_000);
+
+                    let raw: u32 = adc1.read(&mut adc_pin).unwrap_or(0);
+                    let raw = (raw >> 4) as u16;
+
+                    let ch = (s2_val << 2) | (s1_val << 1) | s0_val;
+                    info!(
+                        "S2={} S1={} S0={} -> Ch{}: {}",
+                        s2_val, s1_val, s0_val, ch, raw
+                    );
+                }
+            }
+        }
 
         (
-            Shared { tick_ms: 0 },
+            Shared {
+                tick_ms: 0,
+                last_debug_tick: 0,
+                key_states: [KeyState::new(); NUM_KEYS],
+            },
             Local {
                 audio: system.audio,
                 adc1,
@@ -210,7 +273,6 @@ mod app {
                 s0,
                 s1,
                 s2,
-                key_states: [KeyState::new(); NUM_KEYS],
             },
             init::Monotonics(),
         )
@@ -235,21 +297,34 @@ mod app {
 
     // ── 1 ms SysTick ─────────────────────────────────────────────────────────────
 
-    #[task(binds = SysTick, shared = [tick_ms], priority = 15)]
+    #[task(binds = SysTick, shared = [tick_ms, last_debug_tick], priority = 15)]
     fn systick(mut ctx: systick::Context) {
-        ctx.shared.tick_ms.lock(|t| *t = t.wrapping_add(1));
+        info!("tick");
+        let now = ctx.shared.tick_ms.lock(|t| {
+            *t = t.wrapping_add(1);
+            *t
+        });
 
         // spawn().ok() silently drops if the queue is full -- intentional.
         // Ticks are skipped rather than panicking if scan_keys falls behind.
         scan_keys::spawn().ok();
+
+        // Spawn debug output task periodically
+        if DEBUG_ADC_OUTPUT {
+            let last_debug = ctx.shared.last_debug_tick.lock(|t| *t);
+            if now.wrapping_sub(last_debug) >= DEBUG_OUTPUT_INTERVAL_MS {
+                ctx.shared.last_debug_tick.lock(|t| *t = now);
+                output_adc_values::spawn().ok();
+            }
+        }
     }
 
     // ── Key scanner (spawned every 1 ms by SysTick) ───────────────────────────────
 
     // capacity = 2: allows one queued scan while another is running.
     #[task(
-        local  = [adc1, adc_pin, s0, s1, s2, key_states],
-        shared = [tick_ms],
+        local  = [adc1, adc_pin, s0, s1, s2],
+        shared = [tick_ms, key_states],
         priority = 2,
         capacity = 2,
     )]
@@ -259,7 +334,7 @@ mod app {
         let s0 = ctx.local.s0;
         let s1 = ctx.local.s1;
         let s2 = ctx.local.s2;
-        let states = ctx.local.key_states;
+        info!("scanning keys");
 
         let now = ctx.shared.tick_ms.lock(|t| *t);
 
@@ -275,10 +350,52 @@ mod app {
             let raw: u32 = adc.read(adc_pin).unwrap_or(0);
             let raw = (raw >> 4) as u16;
 
-            if let Some(event) = states[key_idx].update(raw, now) {
-                handle_key_event(key_idx, event);
-            }
+            // Lock key_states to update it
+            ctx.shared.key_states.lock(|states| {
+                if let Some(event) = states[key_idx].update(raw, now) {
+                    handle_key_event(key_idx, event);
+                }
+            });
         }
+    }
+
+    // ── Debug: Output ADC values ─────────────────────────────────────────────────
+
+    #[task(
+        shared = [key_states],
+        priority = 1,
+        capacity = 2,
+    )]
+    fn output_adc_values(mut ctx: output_adc_values::Context) {
+        // Lock key_states to read the ADC values
+        ctx.shared.key_states.lock(|states| {
+            // Build a formatted string of ADC values
+            let mut output = heapless::String::<128>::new();
+
+            if DEBUG_CHANNELS.is_empty() {
+                // Output all channels
+                output.push_str("ADC: ").ok();
+                for (i, state) in states.iter().enumerate() {
+                    if i > 0 {
+                        output.push_str(", ").ok();
+                    }
+                    write!(&mut output, "{}:{}", i, state.last_adc).ok();
+                }
+            } else {
+                // Output only specified channels
+                output.push_str("ADC (selected): ").ok();
+                for (j, &ch) in DEBUG_CHANNELS.iter().enumerate() {
+                    if ch < NUM_KEYS {
+                        if j > 0 {
+                            output.push_str(", ").ok();
+                        }
+                        write!(&mut output, "{}:{}", ch, states[ch].last_adc).ok();
+                    }
+                }
+            }
+
+            info!("{}", output);
+        });
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────────
