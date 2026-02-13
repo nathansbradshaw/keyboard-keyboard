@@ -16,13 +16,10 @@ mod midi_sender;
 mod app {
     const BLOCK_SIZE: usize = 128;
     const NUM_KEYS: usize = 8;
-    const NUM_ACTIVE_KEYS: usize = 6; // Only ch=0 is connected right now
+    const NUM_ACTIVE_KEYS: usize = 6;
 
     // Map each mux channel to a MIDI note number.
-    // Adjust to match your physical key layout.
-    const KEY_TO_NOTE: [u8; NUM_KEYS] = [
-        60, 61, 62, 63, 64, 65, 66, 67, // C4 chromatic
-    ];
+    const KEY_TO_NOTE: [u8; NUM_KEYS] = [48, 50, 52, 55, 57, 60, 62, 64];
 
     use crate::midi_sender::MidiSender;
     use libdaisy::gpio::*;
@@ -46,20 +43,70 @@ mod app {
     const ADC_RESOLUTION: Resolution = Resolution::TwelveBit;
 
     // ── Calibration ────────────────────────────────────────────────────────────
-    // Number of samples averaged per channel at startup to establish baseline.
     const CALIBRATION_SAMPLES: usize = 64;
 
     // ── Key thresholds (relative to per-channel baseline) ─────────────────────
-    // Tune SECOND_DELTA to roughly the count rise at the bottom of key travel.
-    // Log elapsed_ms during development to find a good VELOCITY_WINDOW_MS.
-    const FIRST_DELTA: u16 = 200; // ~20% of travel
-    const SECOND_DELTA: u16 = 400; // ~40% of travel - tune based on actual max delta
-    const RELEASE_DELTA: u16 = 150; // must drop below 150 to release
+    const FIRST_DELTA: u16 = 200;
+    const SECOND_DELTA: u16 = 400;
+    const RELEASE_DELTA: u16 = 150;
+
+    // ── Debounce ───────────────────────────────────────────────────────────────
+    // How many consecutive ticks a threshold must be exceeded before we act.
+    // At 1kHz scan rate, 3 ticks = 3ms — filters out single-sample noise
+    // spikes while adding negligible latency.
+    const DEBOUNCE_TICKS: u8 = 3;
+
+    // ── Moving average filter ──────────────────────────────────────────────────
+    // Number of samples to average per channel. Must be a power of 2 for
+    // efficient division. 4 samples = 4ms of smoothing at 1kHz.
+    const FILTER_SIZE: usize = 4;
+    const FILTER_SHIFT: u32 = 2; // log2(FILTER_SIZE)
 
     // ── Velocity ───────────────────────────────────────────────────────────────
-    // Set this to the elapsed-ms of your slowest intentional keypress (pp).
-    // Everything faster maps linearly up to 127; slower clamps to 1.
     const VELOCITY_WINDOW_MS: u32 = 80;
+
+    // ── Diagnostic logging ─────────────────────────────────────────────────────
+    // Set to true to log raw ADC values every LOG_INTERVAL_MS.
+    // Use this to see what your channels are doing at rest and find noise.
+    const DIAG_LOGGING: bool = true;
+    const LOG_INTERVAL_MS: u32 = 500;
+
+    // ── Per-channel filter state ───────────────────────────────────────────────
+    #[derive(Clone, Copy)]
+    pub struct ChannelFilter {
+        ring: [u16; FILTER_SIZE],
+        index: usize,
+        sum: u32,
+    }
+
+    impl ChannelFilter {
+        const fn new() -> Self {
+            Self {
+                ring: [0; FILTER_SIZE],
+                index: 0,
+                sum: 0,
+            }
+        }
+
+        /// Feed a new raw sample, return the filtered (averaged) value.
+        fn feed(&mut self, raw: u16) -> u16 {
+            // Subtract the oldest sample, add the new one
+            self.sum -= self.ring[self.index] as u32;
+            self.sum += raw as u32;
+            self.ring[self.index] = raw;
+            self.index = (self.index + 1) % FILTER_SIZE;
+            (self.sum >> FILTER_SHIFT) as u16
+        }
+
+        /// Prime all slots with the same value (used after calibration).
+        fn prime(&mut self, value: u16) {
+            for slot in self.ring.iter_mut() {
+                *slot = value;
+            }
+            self.sum = value as u32 * FILTER_SIZE as u32;
+            self.index = 0;
+        }
+    }
 
     // ── Key state machine ──────────────────────────────────────────────────────
     #[derive(Clone, Copy, Debug)]
@@ -73,6 +120,8 @@ mod app {
     pub struct KeyState {
         phase: KeyPhase,
         pub last_adc: u16,
+        /// Counts consecutive ticks above/below a threshold for debouncing.
+        debounce_count: u8,
     }
 
     impl KeyState {
@@ -80,12 +129,10 @@ mod app {
             Self {
                 phase: KeyPhase::Idle,
                 last_adc: 0,
+                debounce_count: 0,
             }
         }
 
-        /// `adc_value` is the raw reading; `baseline` is the resting value
-        /// captured at boot. All threshold comparisons use the delta so the
-        /// firmware works regardless of sensor placement or supply voltage.
         fn update(
             &mut self,
             adc_value: u16,
@@ -94,55 +141,77 @@ mod app {
             key_idx: usize,
         ) -> Option<KeyEvent> {
             self.last_adc = adc_value;
-
-            // How far above rest is the sensor right now?
             let delta = adc_value.saturating_sub(baseline);
 
             match self.phase {
                 KeyPhase::Idle => {
                     if delta >= FIRST_DELTA {
-                        info!(
-                            "key={} FirstActuated: delta={} adc={} baseline={}",
-                            key_idx, delta, adc_value, baseline
-                        );
-                        self.phase = KeyPhase::FirstActuated { tick };
+                        self.debounce_count = self.debounce_count.saturating_add(1);
+                        if self.debounce_count >= DEBOUNCE_TICKS {
+                            info!(
+                                "key={} FirstActuated: delta={} adc={} baseline={}",
+                                key_idx, delta, adc_value, baseline
+                            );
+                            self.phase = KeyPhase::FirstActuated { tick };
+                            self.debounce_count = 0;
+                        }
+                    } else {
+                        self.debounce_count = 0;
                     }
                     None
                 }
 
                 KeyPhase::FirstActuated { tick: t1 } => {
                     if delta >= SECOND_DELTA {
-                        // Key reached full actuation — compute velocity from
-                        // how long it took to travel from FIRST to SECOND.
-                        let elapsed = tick.saturating_sub(t1);
-                        info!("key fully actuated: delta={} elapsed={}ms", delta, elapsed);
+                        self.debounce_count = self.debounce_count.saturating_add(1);
+                        if self.debounce_count >= DEBOUNCE_TICKS {
+                            let elapsed = tick.saturating_sub(t1);
+                            info!(
+                                "key={} fully actuated: delta={} elapsed={}ms",
+                                key_idx, delta, elapsed
+                            );
 
-                        let velocity = if elapsed == 0 {
-                            127u8
-                        } else if elapsed >= VELOCITY_WINDOW_MS {
-                            1u8
+                            let velocity = if elapsed == 0 {
+                                127u8
+                            } else if elapsed >= VELOCITY_WINDOW_MS {
+                                1u8
+                            } else {
+                                let v = 127u32.saturating_sub((elapsed * 126) / VELOCITY_WINDOW_MS);
+                                (v + 1).min(127) as u8
+                            };
+
+                            self.phase = KeyPhase::FullyActuated { velocity };
+                            self.debounce_count = 0;
+                            Some(KeyEvent::NoteOn { velocity })
                         } else {
-                            // Linear mapping: 0ms → 127, VELOCITY_WINDOW_MS → 1
-                            let v = 127u32.saturating_sub((elapsed * 126) / VELOCITY_WINDOW_MS);
-                            (v + 1).min(127) as u8
-                        };
-
-                        self.phase = KeyPhase::FullyActuated { velocity };
-                        Some(KeyEvent::NoteOn { velocity })
+                            None
+                        }
                     } else if delta < RELEASE_DELTA {
-                        // Released before reaching full actuation (light brush).
-                        self.phase = KeyPhase::Idle;
+                        self.debounce_count = self.debounce_count.saturating_add(1);
+                        if self.debounce_count >= DEBOUNCE_TICKS {
+                            self.phase = KeyPhase::Idle;
+                            self.debounce_count = 0;
+                        }
                         None
                     } else {
+                        // In between thresholds — reset debounce
+                        self.debounce_count = 0;
                         None
                     }
                 }
 
                 KeyPhase::FullyActuated { .. } => {
                     if delta < RELEASE_DELTA {
-                        self.phase = KeyPhase::Idle;
-                        Some(KeyEvent::NoteOff)
+                        self.debounce_count = self.debounce_count.saturating_add(1);
+                        if self.debounce_count >= DEBOUNCE_TICKS {
+                            self.phase = KeyPhase::Idle;
+                            self.debounce_count = 0;
+                            Some(KeyEvent::NoteOff)
+                        } else {
+                            None
+                        }
                     } else {
+                        self.debounce_count = 0;
                         None
                     }
                 }
@@ -176,6 +245,7 @@ mod app {
         timer2: timer::Timer<stm32::TIM2>,
         adc_buffer: [u32; NUM_KEYS],
         midi_sender: MidiSender,
+        filters: [ChannelFilter; NUM_KEYS],
     }
 
     // ── init ────────────────────────────────────────────────────────────────────
@@ -204,13 +274,12 @@ mod app {
         cortex_m::asm::delay(480 * 50_000); // 50ms startup delay
 
         // ── Baseline calibration ─────────────────────────────────────
-        // Sample every channel CALIBRATION_SAMPLES times and average.
-        // Keys must be fully released during this window (~few ms total).
         let mut baselines = [0u16; NUM_KEYS];
+        let mut filters = [ChannelFilter::new(); NUM_KEYS];
+
         for ch in 0..NUM_ACTIVE_KEYS {
             set_mux_channel(ch, &mut s0, &mut s1, &mut s2);
-            // Let the mux and sensor settle before we start sampling.
-            cortex_m::asm::delay(480 * 100); // 100µs
+            cortex_m::asm::delay(480 * 200); // 200µs — longer settle for calibration
 
             let mut accumulator: u32 = 0;
             let mut sample_count = 0u32;
@@ -219,12 +288,11 @@ mod app {
                 if let Ok(raw) = result {
                     accumulator += raw;
                     sample_count += 1;
-                    // Log first few samples to see what's happening
                     if ch == 0 && i < 5 {
                         info!("calibration ch=0 sample {} raw={}", i, raw);
                     }
                 }
-                cortex_m::asm::delay(480 * 10); // 10µs between samples
+                cortex_m::asm::delay(480 * 10);
             }
             let avg = if sample_count > 0 {
                 accumulator / sample_count
@@ -232,6 +300,11 @@ mod app {
                 0
             };
             baselines[ch] = avg as u16;
+
+            // Prime the moving average filter with the baseline value
+            // so it doesn't ramp up from zero on first scan.
+            filters[ch].prime(avg as u16);
+
             info!(
                 "baseline ch={} value={} (from {} samples)",
                 ch, baselines[ch], sample_count
@@ -239,8 +312,6 @@ mod app {
         }
 
         // ── MIDI UART (USART1 @ 31250 baud) ─────────────────────────
-        // Following the same pattern as the Synthphone-E project.
-        // daisy13 = USART1_TX, daisy14 = USART1_RX (AF7)
         let midi_tx_pin = system
             .gpio
             .daisy13
@@ -268,9 +339,8 @@ mod app {
             )
             .unwrap();
 
-        // We only need TX for output. Discard RX.
         let (midi_tx, _midi_rx) = midi_serial.split();
-        let midi_sender = MidiSender::new(midi_tx, 0); // Channel 0 = "Channel 1"
+        let midi_sender = MidiSender::new(midi_tx, 0);
 
         // ── Timer2 @ 1 kHz ───────────────────────────────────────────
         let mut timer2 = stm32h7xx_hal::timer::TimerExt::timer(
@@ -281,10 +351,12 @@ mod app {
         );
         timer2.listen(timer::Event::TimeOut);
 
-        // Prime mux at channel 0 before the first interrupt fires.
         set_mux_channel(0, &mut s0, &mut s1, &mut s2);
 
-        info!("Hall effect keyboard startup done!");
+        info!(
+            "Hall effect keyboard startup done! (DIAG_LOGGING={})",
+            DIAG_LOGGING
+        );
 
         (
             Shared {
@@ -303,6 +375,7 @@ mod app {
                 timer2,
                 adc_buffer: [0; NUM_KEYS],
                 midi_sender,
+                filters,
             },
             init::Monotonics(),
         )
@@ -323,48 +396,61 @@ mod app {
     }
 
     // ── Timer @ 1 kHz ─────────────────────────────────────────────────────────
-    // Scans all active channels every tick. Total scan takes ~16µs (8 × 2µs
-    // settle), well within the 1ms budget. All key state updates happen here
-    // so latency is bounded to one tick (~1ms).
     #[task(
         binds = TIM2,
-        local  = [timer2, adc, adc_pin, s0, s1, s2, adc_buffer],
+        local  = [timer2, adc, adc_pin, s0, s1, s2, adc_buffer, filters],
         shared = [tick_ms, key_states, baselines, event_queue],
         priority = 15
     )]
     fn timer_handler(mut ctx: timer_handler::Context) {
         ctx.local.timer2.clear_irq();
 
-        // Increment and snapshot the millisecond counter.
         let now = ctx.shared.tick_ms.lock(|t| {
             *t = t.wrapping_add(1);
             *t
         });
 
-        // Collect events into a stack buffer so we only take each lock once.
         let mut pending: heapless::Vec<(usize, KeyEvent), 8> = heapless::Vec::new();
-
-        // Read baselines once — they never change after init.
         let baselines = ctx.shared.baselines.lock(|b| *b);
 
         for ch in 0..NUM_ACTIVE_KEYS {
             set_mux_channel(ch, ctx.local.s0, ctx.local.s1, ctx.local.s2);
-            // ~2µs for mux switching + A1302 output settling.
-            cortex_m::asm::delay(480 * 2);
+            // Increased settle time: 10µs instead of 2µs.
+            // This gives the mux output + ADC input capacitance time to
+            // settle to the new channel's voltage, preventing crosstalk
+            // from the previous channel bleeding into this reading.
+            cortex_m::asm::delay(480 * 10);
 
             let result: Result<u32, _> = ctx.local.adc.read(ctx.local.adc_pin);
             if let Ok(raw) = result {
                 ctx.local.adc_buffer[ch] = raw;
 
+                // Feed through the moving average filter before threshold comparison.
+                let filtered = ctx.local.filters[ch].feed(raw as u16);
+
                 ctx.shared.key_states.lock(|states| {
-                    if let Some(event) = states[ch].update(raw as u16, baselines[ch], now, ch) {
+                    if let Some(event) = states[ch].update(filtered, baselines[ch], now, ch) {
                         pending.push((ch, event)).ok();
                     }
                 });
             }
         }
 
-        // Single lock to flush all events into the queue.
+        // ── Diagnostic logging ───────────────────────────────────────
+        // Every LOG_INTERVAL_MS, dump the filtered delta for every active
+        // channel so you can see what's happening at rest.
+        if DIAG_LOGGING && now % LOG_INTERVAL_MS == 0 {
+            for ch in 0..NUM_ACTIVE_KEYS {
+                let filtered = (ctx.local.filters[ch].sum >> FILTER_SHIFT) as u16;
+                let delta = filtered.saturating_sub(baselines[ch]);
+                let raw = ctx.local.adc_buffer[ch];
+                info!(
+                    "DIAG ch={} raw={} filtered={} baseline={} delta={}",
+                    ch, raw, filtered, baselines[ch], delta
+                );
+            }
+        }
+
         if !pending.is_empty() {
             ctx.shared.event_queue.lock(|queue| {
                 for item in pending {
