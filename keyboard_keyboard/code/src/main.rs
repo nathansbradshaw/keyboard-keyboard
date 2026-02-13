@@ -1,9 +1,12 @@
 //! hall_effect_keyboard — Daisy Seed + CD74HC4051 + A1302
 //! Relative-threshold scanning with per-channel baseline calibration
+//! MIDI output over USART1 at 31250 baud
 #![no_main]
 #![no_std]
 
 use panic_rtt_target as _;
+
+mod midi_sender;
 
 #[rtic::app(
     device = stm32h7xx_hal::stm32,
@@ -13,8 +16,15 @@ use panic_rtt_target as _;
 mod app {
     const BLOCK_SIZE: usize = 128;
     const NUM_KEYS: usize = 8;
-    const NUM_ACTIVE_KEYS: usize = 1; // Only ch=0 is connected right now
+    const NUM_ACTIVE_KEYS: usize = 6; // Only ch=0 is connected right now
 
+    // Map each mux channel to a MIDI note number.
+    // Adjust to match your physical key layout.
+    const KEY_TO_NOTE: [u8; NUM_KEYS] = [
+        60, 61, 62, 63, 64, 65, 66, 67, // C4 chromatic
+    ];
+
+    use crate::midi_sender::MidiSender;
     use libdaisy::gpio::*;
     use libdaisy::logger;
     use libdaisy::{audio, system};
@@ -24,7 +34,10 @@ mod app {
         adc::{self, Adc, AdcSampleTime, Resolution},
         gpio::{Analog, Output, PushPull},
         prelude::*,
-        stm32, timer,
+        serial::{config::Config as SerialConfig, SerialExt},
+        stm32,
+        time::U32Ext,
+        timer,
     };
     use log::info;
 
@@ -162,6 +175,7 @@ mod app {
         s2: Daisy2<Output<PushPull>>,
         timer2: timer::Timer<stm32::TIM2>,
         adc_buffer: [u32; NUM_KEYS],
+        midi_sender: MidiSender,
     }
 
     // ── init ────────────────────────────────────────────────────────────────────
@@ -175,7 +189,7 @@ mod app {
         let ccdr = system::System::init_clocks(device.PWR, device.RCC, &device.SYSCFG);
         let mut system = libdaisy::system_init!(core, device, ccdr, BLOCK_SIZE);
 
-        // ── GPIO ─────────────────────────────────────────────────────
+        // ── GPIO (mux select lines) ─────────────────────────────────
         let mut s0 = system.gpio.daisy0.take().unwrap().into_push_pull_output();
         let mut s1 = system.gpio.daisy1.take().unwrap().into_push_pull_output();
         let mut s2 = system.gpio.daisy2.take().unwrap().into_push_pull_output();
@@ -196,7 +210,7 @@ mod app {
         for ch in 0..NUM_ACTIVE_KEYS {
             set_mux_channel(ch, &mut s0, &mut s1, &mut s2);
             // Let the mux and sensor settle before we start sampling.
-            cortex_m::asm::delay(480 * 100); // Increased from 10 to 100 (100µs)
+            cortex_m::asm::delay(480 * 100); // 100µs
 
             let mut accumulator: u32 = 0;
             let mut sample_count = 0u32;
@@ -210,7 +224,7 @@ mod app {
                         info!("calibration ch=0 sample {} raw={}", i, raw);
                     }
                 }
-                cortex_m::asm::delay(480 * 10); // Increased from 2 to 10 (10µs between samples)
+                cortex_m::asm::delay(480 * 10); // 10µs between samples
             }
             let avg = if sample_count > 0 {
                 accumulator / sample_count
@@ -223,6 +237,40 @@ mod app {
                 ch, baselines[ch], sample_count
             );
         }
+
+        // ── MIDI UART (USART1 @ 31250 baud) ─────────────────────────
+        // Following the same pattern as the Synthphone-E project.
+        // daisy13 = USART1_TX, daisy14 = USART1_RX (AF7)
+        let midi_tx_pin = system
+            .gpio
+            .daisy13
+            .take()
+            .expect("Failed to get daisy13 for MIDI TX")
+            .into_alternate::<7>();
+
+        let midi_rx_pin = system
+            .gpio
+            .daisy14
+            .take()
+            .expect("Failed to get daisy14 for MIDI RX")
+            .into_alternate::<7>();
+
+        let mut midi_config = SerialConfig::default();
+        midi_config.baudrate = 31_250_u32.bps();
+
+        let midi_serial = device
+            .USART1
+            .serial(
+                (midi_tx_pin, midi_rx_pin),
+                midi_config,
+                ccdr.peripheral.USART1,
+                &ccdr.clocks,
+            )
+            .unwrap();
+
+        // We only need TX for output. Discard RX.
+        let (midi_tx, _midi_rx) = midi_serial.split();
+        let midi_sender = MidiSender::new(midi_tx, 0); // Channel 0 = "Channel 1"
 
         // ── Timer2 @ 1 kHz ───────────────────────────────────────────
         let mut timer2 = stm32h7xx_hal::timer::TimerExt::timer(
@@ -254,6 +302,7 @@ mod app {
                 s2,
                 timer2,
                 adc_buffer: [0; NUM_KEYS],
+                midi_sender,
             },
             init::Monotonics(),
         )
@@ -274,9 +323,9 @@ mod app {
     }
 
     // ── Timer @ 1 kHz ─────────────────────────────────────────────────────────
-    // Scans all 8 channels every tick. Total scan takes ~16µs (8 × 2µs settle),
-    // well within the 1ms budget. All key state updates happen here so latency
-    // is bounded to one tick (~1ms).
+    // Scans all active channels every tick. Total scan takes ~16µs (8 × 2µs
+    // settle), well within the 1ms budget. All key state updates happen here
+    // so latency is bounded to one tick (~1ms).
     #[task(
         binds = TIM2,
         local  = [timer2, adc, adc_pin, s0, s1, s2, adc_buffer],
@@ -327,21 +376,21 @@ mod app {
         process_events::spawn().ok();
     }
 
-    // ── Process events ────────────────────────────────────────────────────────
-    #[task(shared = [event_queue], priority = 1, capacity = 32)]
+    // ── Process events → send MIDI ────────────────────────────────────────────
+    #[task(shared = [event_queue], local = [midi_sender], priority = 1, capacity = 32)]
     fn process_events(mut ctx: process_events::Context) {
         ctx.shared.event_queue.lock(|queue| {
             while let Some((key_idx, event)) = queue.dequeue() {
+                let note = KEY_TO_NOTE[key_idx];
+
                 match event {
                     KeyEvent::NoteOn { velocity } => {
-                        let note = 60u8 + key_idx as u8;
-                        info!("NoteOn  key={} note={} vel={}", key_idx, note, velocity);
-                        // TODO: send USB MIDI / I2S tone etc.
+                        info!("TX NoteOn  key={} note={} vel={}", key_idx, note, velocity);
+                        ctx.local.midi_sender.note_on(note, velocity);
                     }
                     KeyEvent::NoteOff => {
-                        let note = 60u8 + key_idx as u8;
-                        info!("NoteOff key={} note={}", key_idx, note);
-                        // TODO: send USB MIDI / I2S tone etc.
+                        info!("TX NoteOff key={} note={}", key_idx, note);
+                        ctx.local.midi_sender.note_off(note, 0);
                     }
                 }
             }

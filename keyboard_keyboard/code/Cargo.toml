@@ -30,7 +30,6 @@ micromath = "2.1.0"
 microfft = "0.6"
 libdaisy = {git = "https://github.com/nathansbradshaw/libdaisy-rust.git", features = ["log-rtt"], commit = "f08c01fd8f950675c6c1051c2310c1cdf7309d8b"}
 synthphone-e-vocal-dsp = {git = "https://github.com/nathansbradshaw/synthphone_e_vocal_dsp.git", commit = "a794ea0acdd376bd6444fbe7fd6df444a6addc6f"}
-# synthphone-e-vocal-dsp = { path = "../synthphone_vocals/"}
 libm = "0.2.8"
 heapless = "0.8.0"
 ssd1306 = "0.7.1"
